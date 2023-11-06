@@ -114,7 +114,64 @@ class CLIPTextModelOutput(ModelOutput):
     last_hidden_state: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    layer_past: Optional[Tuple[torch.FloatTensor]] = None
 
+
+
+# taken from tom aarsen's attention sinks
+def slice1d(x, start, end):
+    return x[:, start:end, ...]
+
+
+def slice2d(x, start, end):
+    return x[:, :, start:end, ...]
+
+
+def slice3d(x, start, end):
+    return x[:, :, :, start:end, ...]
+DIM_TO_SLICE = {
+    1: slice1d,
+    2: slice2d,
+    3: slice3d,
+}
+
+@dataclass
+class AttentionSinkKVCache:
+    attention_sink_size: int = 4
+    attention_sink_window_size: int = 77
+    k_seq_dim: int = 2
+    v_seq_dim: int = 2
+
+    def __post_init__(self):
+        self.cache_size = self.attention_sink_size + self.attention_sink_window_size
+        self.k_slice = DIM_TO_SLICE[self.k_seq_dim]
+        self.v_slice = DIM_TO_SLICE[self.v_seq_dim]
+
+    def __call__(self, past_key_values):
+        if past_key_values is None:
+            return None
+        seq_len = past_key_values[0][0].size(self.k_seq_dim)
+        if seq_len <= self.cache_size:
+            return past_key_values
+        return [
+            [
+                torch.cat(
+                    [
+                        self.k_slice(k, 0, self.attention_sink_size),
+                        self.k_slice(k, seq_len - self.attention_sink_window_size, seq_len),
+                    ],
+                    dim=self.k_seq_dim,
+                ),
+                torch.cat(
+                    [
+                        self.v_slice(v, 0, self.attention_sink_size),
+                        self.v_slice(v, seq_len - self.attention_sink_window_size, seq_len),
+                    ],
+                    dim=self.v_seq_dim,
+                ),
+            ]
+            for k, v in past_key_values
+        ]
 
 @dataclass
 class CLIPOutput(ModelOutput):
@@ -252,6 +309,9 @@ class CLIPAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        attention_evict_prop: float = 1.0,
+        use_cache: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -267,6 +327,19 @@ class CLIPAttention(nn.Module):
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            assert past_key.shape == key_states.shape
+            assert past_value.shape == value_states.shape
+            key_channel_dim = past_key.shape[1]
+            channels_evicted = int(key_channel_dim*attention_evict_prop)
+
+            key_states = torch.cat((past_key[:, :-channels_evicted], key_states[:, :channels_evicted]), dim=-2)
+            value_states = torch.cat((past_value[:, :-channels_evicted], value_states[:, :channels_evicted]), dim=-2)
+        if use_cache is True:
+            present = (key_states, value_states)
+        else:
+            present = None
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
@@ -322,7 +395,7 @@ class CLIPAttention(nn.Module):
 
         attn_output = self.out_proj(attn_output)
 
-        return attn_output, attn_weights_reshaped
+        return attn_output, attn_weights_reshaped, present
 
 
 class CLIPMLP(nn.Module):
@@ -355,6 +428,9 @@ class CLIPEncoderLayer(nn.Module):
         attention_mask: torch.Tensor,
         causal_attention_mask: torch.Tensor,
         output_attentions: Optional[bool] = False,
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        attention_evict_prop: float = 1.0,
+        use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor]:
         """
         Args:
@@ -369,11 +445,14 @@ class CLIPEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
+        hidden_states, attn_weights, present = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             causal_attention_mask=causal_attention_mask,
             output_attentions=output_attentions,
+            layer_past=layer_past,
+            attention_evict_prop=attention_evict_prop,
+            use_cache=use_cache
         )
         hidden_states = residual + hidden_states
 
@@ -386,6 +465,8 @@ class CLIPEncoderLayer(nn.Module):
 
         if output_attentions:
             outputs += (attn_weights,)
+        if use_cache:
+            outputs += (present,)
 
         return outputs
 
@@ -577,6 +658,10 @@ class CLIPEncoder(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        layer_past = None,
+        attention_evict_prop: float = 1.0,
+        final_attention_evict_prop: float = 0.94,
+        use_cache: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutput]:
         r"""
         Args:
@@ -615,11 +700,13 @@ class CLIPEncoder(nn.Module):
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
+        all_layer_past = () if use_cache else None
 
         hidden_states = inputs_embeds
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
+            curr_attention_evict_prop = attention_evict_prop*(float(idx)/len(self.layers))+final_attention_evict_prop*(1-float(idx)/len(self.layers))
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     encoder_layer.__call__,
@@ -627,6 +714,9 @@ class CLIPEncoder(nn.Module):
                     attention_mask,
                     causal_attention_mask,
                     output_attentions,
+                    layer_past=layer_past[idx] if layer_past is not None else None,
+                    attention_evict_prop=curr_attention_evict_prop,
+                    use_cache=use_cache
                 )
             else:
                 layer_outputs = encoder_layer(
@@ -634,20 +724,25 @@ class CLIPEncoder(nn.Module):
                     attention_mask,
                     causal_attention_mask,
                     output_attentions=output_attentions,
+                    layer_past=layer_past[idx] if layer_past is not None else None,
+                    attention_evict_prop=curr_attention_evict_prop,
+                    use_cache=use_cache
                 )
 
             hidden_states = layer_outputs[0]
 
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
+            if use_cache:
+                all_layer_past = all_layer_past + (layer_outputs[2],)
 
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
+            return tuple(v for v in [hidden_states, encoder_states, all_attentions, all_layer_past] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
+            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions, layer_past=all_layer_past
         )
 
 
@@ -673,6 +768,10 @@ class CLIPTextTransformer(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        layer_past = None,
+        attention_evict_prop: float = 1.0,
+        final_attention_evict_prop: float = 0.94,
+        use_cache: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         r"""
         Returns:
@@ -709,6 +808,10 @@ class CLIPTextTransformer(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            layer_past = layer_past,
+            attention_evict_prop=attention_evict_prop,
+            final_attention_evict_prop=final_attention_evict_prop,
+            use_cache=use_cache,
         )
 
         last_hidden_state = encoder_outputs[0]
@@ -743,6 +846,7 @@ class CLIPTextTransformer(nn.Module):
             pooler_output=pooled_output,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
+            layer_past=encoder_outputs.layer_past
         )
 
 
@@ -777,6 +881,10 @@ class CLIPTextModel(CLIPPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        layer_past = None,
+        attention_evict_prop: float = 1.0,
+        final_attention_evict_prop: float = 0.94,
+        use_cache: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         r"""
         Returns:
@@ -804,6 +912,10 @@ class CLIPTextModel(CLIPPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            layer_past = layer_past,
+            attention_evict_prop=attention_evict_prop,
+            final_attention_evict_prop=final_attention_evict_prop,
+            use_cache=use_cache,
         )
 
 
@@ -1186,6 +1298,10 @@ class CLIPTextModelWithProjection(CLIPPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        layer_past = None,
+        attention_evict_prop: float = 1.0,
+        final_attention_evict_prop: float = 0.94,
+        use_cache: Optional[bool] = False,
     ) -> Union[Tuple, CLIPTextModelOutput]:
         r"""
         Returns:
@@ -1212,6 +1328,10 @@ class CLIPTextModelWithProjection(CLIPPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            layer_past = layer_past,
+            attention_evict_prop=attention_evict_prop,
+            final_attention_evict_prop=final_attention_evict_prop,
+            use_cache=use_cache,
         )
 
         pooled_output = text_outputs[1]
@@ -1227,6 +1347,7 @@ class CLIPTextModelWithProjection(CLIPPreTrainedModel):
             last_hidden_state=text_outputs.last_hidden_state,
             hidden_states=text_outputs.hidden_states,
             attentions=text_outputs.attentions,
+            layer_past=text_outputs.layer_past
         )
 
 
